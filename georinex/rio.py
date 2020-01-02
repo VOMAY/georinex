@@ -1,3 +1,4 @@
+from datetime import datetime
 import gzip
 import zipfile
 from pathlib import Path
@@ -167,3 +168,107 @@ def rinex_version(s: str) -> typing.Tuple[typing.Union[float, str], bool]:
     is_crinex = s[20:40] == 'COMPACT RINEX FORMAT'
 
     return vers, is_crinex
+
+
+class HeaderClass:
+    """ Class to interpret and store Rinex Header information
+    """
+
+    # Dictionary mapping the RINEX header labels to the correct parsing function
+    labelDict = {'RINEX VERSION / TYPE': 'pInfo',
+                 'MARKER NAME': 'pMarkerName',
+                 'MARKER NUMBER': 'pMarkerNumber',
+                 'OBSERVER / AGENCY': 'pObservAgency',
+                 'REC # / TYPE / VERS': 'pReceiver',
+                 'ANT # / TYPE': 'pAntenna',
+                 'APPROX POSITION XYZ': 'pPosition',
+                 'SYS / # / OBS TYPES': 'pSignal',
+                 'TIME OF FIRST OBS': 'pTimeFirst',
+                 'TIME OF LAST OBS': 'pTimeLast',
+                 'INTERVAL': 'pInterval'}
+
+    def __init__(self, info):
+        """ Init class with info from rinexinfo()
+        """
+        self.version = info['version']
+        self.fileType = info['filetype']
+        self.rinexType = info['rinextype']
+        self.systems = info['systems']
+
+        self.obsType = dict()
+
+    def pInfo(self, info):
+        self.version = info['version']
+        self.fileType = info['filetype']
+        self.rinexType = info['rinextype']
+        self.systems = info['systems']
+
+    def pMarkerName(self, h: str):
+        self.markername = h.strip()
+
+    def pMarkerNumber(self, h: str):
+        self.markernumber = h.strip()
+
+    def pObservAgency(self, h: str):
+        self.observer = h[0:20].strip()
+        self.agency = h[20:60].strip()
+
+    def pReceiver(self, h: str):
+        self.recNumber = h[0:20].strip()
+        self.recType = h[20:40].strip()
+        self.recVersion = h[40:60].strip()
+
+    def pAntenna(self, h: str):
+        self.antNumber = h[0:20].strip()
+        self.antType = h[20:40].strip()
+
+    def pPosition(self, h: str):
+        """ Write coordaintes in list and convert to geodetic
+        """
+        try:
+            self.position= [float(x) for x in h.split()]
+            try:
+                from pymap3d import ecef2geodetic
+            except ImportError:
+                ecef2geodetic = None
+            if ecef2geodetic is not None:
+                self.positionGeodetic = ecef2geodetic(*self.position)
+
+        except (KeyError, ValueError):
+            self.position = None
+
+    def pTimeFirst(self, h: str):
+        try:
+            self.tFirst = datetime(year=int(h[:6]), month=int(h[6:12]), day=int(h[12:18]),
+                             hour=int(h[18:24]), minute=int(h[24:30]), second=int(float(h[30:36])),
+                             microsecond=int(float(h[30:43]) % 1 * 1e6))
+        except (KeyError, ValueError):
+            self.tFirst = None
+
+    def pTimeLast(self, h: str):
+        try:
+            self.tLast = datetime(year=int(h[:6]), month=int(h[6:12]), day=int(h[12:18]),
+                             hour=int(h[18:24]), minute=int(h[24:30]), second=int(float(h[30:36])),
+                             microsecond=int(float(h[30:43]) % 1 * 1e6))
+        except (KeyError, ValueError):
+            self.tLast = None
+
+    def pInterval(self, h: str):
+        try:
+            self.interval = float(h[:10])
+        except (KeyError, ValueError):
+            self.interval = None
+
+    def pSignal(self, h:str):
+        """ Get constellations with signals and store in dictionary.
+            E.g. {'E': ['C1C', 'L1C', 'S1C', 'C6C'],
+                  'R': ['C1C', 'L1C', 'S1C', 'C1P']}
+        """
+        if h[0].strip():
+            self._currConst = h[0]
+
+        if h[3:7].strip():
+            self._currNum   = int(h[3:7])
+            self.obsType[self._currConst] = []
+
+        self.obsType[self._currConst].extend(h[7:59].split())
