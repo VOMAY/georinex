@@ -1,4 +1,5 @@
 from datetime import datetime
+import numpy as np
 import gzip
 import zipfile
 from pathlib import Path
@@ -187,6 +188,13 @@ class HeaderClass:
                  'TIME OF LAST OBS': 'pTimeLast',
                  'INTERVAL': 'pInterval'}
 
+    timeSystemDict = {'G': 'GPS',
+                      'R': 'GLO',
+                      'E': 'GAL',
+                      'J': 'QZS',
+                      'C': 'BDT',
+                      'I': 'IRN'}
+
     def __init__(self, info):
         """ Init class with info from rinexinfo()
         """
@@ -195,13 +203,19 @@ class HeaderClass:
         self.rinexType = info['rinextype']
         self.systems = info['systems']
 
-        self.obsType = dict()
+        # Derive time System (preliminary)
+        if self.systems in self.timeSystemDict.keys():
+            self.timeSystem = self.timeSystemDict[self.systems]
+        else:
+            self.timeSystem = '???'
 
-    def pInfo(self, info):
-        self.version = info['version']
-        self.fileType = info['filetype']
-        self.rinexType = info['rinextype']
-        self.systems = info['systems']
+        self.obsType = {}
+
+#    def pInfo(self, info):
+#        self.version = info['version']
+#        self.fileType = info['filetype']
+#        self.rinexType = info['rinextype']
+#        self.systems = info['systems']
 
     def pMarkerName(self, h: str):
         self.markername = h.strip()
@@ -245,6 +259,10 @@ class HeaderClass:
         except (KeyError, ValueError):
             self.tFirst = None
 
+        # Set Time System
+        if h[48:51].strip():
+            self.timeSystem = h[48:51].strip()
+
     def pTimeLast(self, h: str):
         try:
             self.tLast = datetime(year=int(h[:6]), month=int(h[6:12]), day=int(h[12:18]),
@@ -272,3 +290,13 @@ class HeaderClass:
             self.obsType[self._currConst] = []
 
         self.obsType[self._currConst].extend(h[7:59].split())
+
+    def cInterval(self, time: xarray.DataArray):
+        """Compute Interval from data if missing in header
+        """
+        if not self.interval:
+            try:
+                self.interval = np.median(np.diff(time)/np.timedelta64(1, 's'))
+            except TypeError:
+                self.interval = np.nan
+                pass
