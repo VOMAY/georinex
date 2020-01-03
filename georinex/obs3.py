@@ -1,24 +1,20 @@
-from pathlib import Path
-import numpy as np
-import logging
 from datetime import datetime, timedelta
-import io
-import xarray
+import logging
+from pathlib import Path
 from typing import Dict, Union, List, Tuple, Any, Sequence
 from typing.io import TextIO
+
+import numpy as np
+import xarray as xr
+
+from .rio import opener, rinexinfo, HeaderClass
+from .common import check_time_interval
+"""https://github.com/mvglasow/satstat/wiki/NMEA-IDs"""
+
 try:
     from pymap3d import ecef2geodetic
 except ImportError:
     ecef2geodetic = None
-#
-from .rio import opener, rinexinfo, HeaderClass
-from .common import check_time_interval, check_unique_times
-"""https://github.com/mvglasow/satstat/wiki/NMEA-IDs"""
-
-SBAS = 100  # offset for ID
-GLONASS = 37
-QZSS = 192
-BEIDOU = 0
 
 
 def rinexobs3(fn: Union[TextIO, str, Path],
@@ -28,8 +24,7 @@ def rinexobs3(fn: Union[TextIO, str, Path],
               meas: Sequence[str] = None,
               verbose: bool = False,
               *,
-              fast: bool = False,
-              interval: Union[float, int, timedelta] = None) -> xarray.Dataset:
+              interval: Union[float, int, timedelta] = None) -> xr.Dataset:
     """
     process RINEX 3 OBS data
 
@@ -40,17 +35,11 @@ def rinexobs3(fn: Union[TextIO, str, Path],
     useindicators: SSI, LLI are output
     meas:  'L1C'  or  ['L1C', 'C1C'] or similar
 
-    fast:
-          TODO: FUTURE, not yet enabled for OBS3
-          speculative preallocation based on minimum SV assumption and file size.
-          Avoids double-reading file and more complicated linked lists.
-          Believed that Numpy array should be faster than lists anyway.
-          Reduce Nsvmin if error (let us know)
-
     interval: allows decimating file read by time e.g. every 5 seconds.
                 Useful to speed up reading of very large RINEX files
     """
 
+# %% Check input arguments and initialise
     interval = check_time_interval(interval)
 
     if isinstance(use, str):
@@ -59,17 +48,18 @@ def rinexobs3(fn: Union[TextIO, str, Path],
     if isinstance(meas, str):
         meas = [meas]
 
-    if not use or not use[0].strip():
+    if not use[0].strip():
         use = None
 
-    if not meas or not meas[0].strip():
+    if not meas[0].strip():
         meas = None
 
     if tlim is not None and not isinstance(tlim[0], datetime):
         raise TypeError('time bounds are specified as datetime.datetime')
 
     last_epoch = None
-# %% loop
+
+# %% Parsing loop
     with opener(fn) as f:
         try:
             # Read header into HeaderClass instance
@@ -80,74 +70,93 @@ def rinexobs3(fn: Union[TextIO, str, Path],
 
             # Get set of all signals of all constellations
             signalUnion = sorted(set([ signal for constSigList in selObs.values() for signal in constSigList]))
+
             # Allocate Main internal data buffer
-            bufDict = {}
+            obsBuf = {}
             for signal in signalUnion:
-                bufDict[signal] = {'time': [], 'const': [], 'prn': [], 'val': []}
+                if useindicators:
+                    obsBuf[signal] = {'time': [], 'const': [], 'prn': [], 'val': [], 'ssi': [], 'lli': []}
+                else:
+                    obsBuf[signal] = {'time': [], 'const': [], 'prn': [], 'val': []}
 
         except KeyError:
-            return xarray.Dataset()
+            return xr.Dataset()
 
-# %% process OBS file
+        # %%    Process OBS file
         for ln in f:
-            if not ln.startswith('>'):  # end of file
+            # Check for next epoch
+            if not ln.startswith('>'):
                 break
 
+            # %%Process Epoch Record line
             try:
                 time, in_range = _timeobs(ln, tlim, last_epoch, interval)
             except ValueError:  # garbage between header and RINEX data
                 logging.debug(f'garbage detected in {fn}, trying to parse at next time step')
                 continue
 
-            # Number of visible satellites this time %i3  pg. A13
+            # Number of visible satellites this epoch
             nSv = int(ln[33:35])
+
+            # Check if epoch is in selected interval
             if in_range == -1:
                 for _ in range(nSv):
                     next(f)
                 continue
-
             if in_range == 1:
                 break
-
             last_epoch = time
 
             if verbose:
                 print(time, end="\r")
 
-            # this time epoch is complete, assemble the data.
-            obsd = {}
+            # %% Process observation lines
+            obsEpoch = {}
+            # Read nSv lines and extract selected data
             for _, epochLine in zip(range(nSv), f):
                 # Check if this line starts with an expected constellatin letter
                 if epochLine[0] not in hdr.obsType.keys():
                     raise KeyError(f'Unexpected line found in RINEX file')
 
-                obsd = _epoch(obsd, selObs, selInd, epochLine)
+                obsEpoch = _epoch(obsEpoch, selObs, selInd, epochLine, useindicators)
 
-            for signal in obsd:
-                bufDict[signal]['time'].append(time)
-                bufDict[signal]['const'].append(obsd[signal]['const'])
-                bufDict[signal]['prn'].append(obsd[signal]['prn'])
-                bufDict[signal]['val'].append(obsd[signal]['val'])
+            # Store selected data of epoch in internal buffer obsBuf
+            for signal in obsEpoch:
+                obsBuf[signal]['time'].append(time)
+                obsBuf[signal]['const'].append(obsEpoch[signal]['const'])
+                obsBuf[signal]['prn'].append(obsEpoch[signal]['prn'])
+                obsBuf[signal]['val'].append(obsEpoch[signal]['val'])
+                if useindicators:
+                    obsBuf[signal]['lli'].append(obsEpoch[signal]['lli'])
+                    obsBuf[signal]['ssi'].append(obsEpoch[signal]['ssi'])
 
+    # %% Process OBS file Convert internval buffer (dict) to output format (xarray.DataArray)
+    # First generate one DataArray per signal, then merge them together
     data = []
-    for signal in bufDict:
-        signalTime = bufDict[signal]['time']
-        signalConst = np.sort(np.array(list(set([const for constEpochList in bufDict[signal]['const'] for const in constEpochList]))))
-        signalPrn = np.sort(np.array(list(set([prn for prnEpochList in bufDict[signal]['prn'] for prn in prnEpochList]))))
+    for signal in obsBuf:
+        # Get all times of this signal
+        signalTime = obsBuf[signal]['time']
+        # Get all constalltions with this signal
+        signalConst = np.sort(np.array(list(set([const for constEpochList in obsBuf[signal]['const'] for const in constEpochList]))))
+        # Get all satellites of this constellations with this signal
+        signalPrn = np.sort(np.array(list(set([prn for prnEpochList in obsBuf[signal]['prn'] for prn in prnEpochList]))))
+        # Allocate array of ovservations with three dimensions
         signalVal = np.empty((len(signalTime), len(signalConst), len(signalPrn)))
 
+        # Geneate DataArray and append to list
         data.append(_gen_array(signalTime, signalConst, signalPrn,
-                               bufDict[signal]['const'], bufDict[signal]['prn'], bufDict[signal]['val'],
-                               np.copy(signalVal), signal))
-#        if 'ssi' not in dict_meas[sm]:
-#            continue
-#        data.append(_gen_array(alltime, allsv, dict_meas[sm]['sv'], dict_meas[sm]['ssi'], np.copy(valarray), sm+'-ssi'))
-#        if 'lli' not in dict_meas[sm]:
-#            continue
-#        data.append(_gen_array(alltime, allsv, dict_meas[sm]['sv'], dict_meas[sm]['lli'], np.copy(valarray), sm+'-lli'))
-#
+                               obsBuf[signal]['const'], obsBuf[signal]['prn'], obsBuf[signal]['val'],
+                               signalVal, signal))
+        if useindicators:
+            data.append(_gen_array(signalTime, signalConst, signalPrn,
+                                   obsBuf[signal]['const'], obsBuf[signal]['prn'], obsBuf[signal]['lli'],
+                                   signalVal, signal+'-lli'))
+            data.append(_gen_array(signalTime, signalConst, signalPrn,
+                                   obsBuf[signal]['const'], obsBuf[signal]['prn'], obsBuf[signal]['ssi'],
+                                   signalVal, signal+'-ssi'))
 
-    data = xarray.merge(data)
+    # Merge DataArray
+    data = xr.merge(data)
 
     # Add Attributes
     data.attrs['version'] = hdr.version
@@ -178,8 +187,7 @@ def _timeobs(ln: str, tlim: Tuple[datetime, datetime] = None,
     curr_time = datetime(int(ln[2:6]), int(ln[7:9]), int(ln[10:12]),
                          hour=int(ln[13:15]), minute=int(ln[16:18]),
                          second=int(ln[19:21]),
-                         microsecond=int(float(ln[19:29]) % 1 * 1000000))
-
+                         microsecond=int(float(ln[19:29]) % 1 * 1e6))
     in_range = 0
     if tlim is not None:
         if curr_time < tlim[0]:
@@ -207,71 +215,68 @@ def obstime3(fn: Union[TextIO, Path],
 
     return np.asarray(times)
 
-def _epoch(obsd: Dict[str, Any],
+def _epoch(obsEpoch: Dict[str, Any],
            selObs: Dict[str, Any],
            selInd: Dict[str, Any],
-           line: str) -> (Dict[str, Any]):
+           line: str,
+           useindicators: bool) -> (Dict[str, Any]):
     """
     processing of each line in epoch (time step)
     """
 
-    # Check if constellation is selected
-    sv = line[0:3].replace(' ', '0')
-    const = sv[0]
-    prn = int(sv[1:3])
-    if const not in selObs.keys():
-        return obsd
+    # Get Prn and split in constellation and PRN
+    const = line[0]
+    prn = int(line[1:3])
 
-    # Ensure 16-columns per record and filter the selected records into list
+    # Skip in constellation not selected
+    if const not in selObs.keys():
+        return obsEpoch
+
+    # parse the selected records into list
     recordStr = line[3:]
-    recordStr = recordStr + ' '*(len(recordStr) % 16)
     selRecord = [recordStr[i*16:i*16+16] for i in selInd[const]]
 
     # Store information in buffer dictionary
     for i, signal in enumerate(selObs[const]):
-        # Create key if not available
-        if signal not in obsd.keys():
-            obsd[signal] = {'const': [], 'prn': [], 'val': []}
+        # Create key if not available. Only consider inidcators if selected
+        if signal not in obsEpoch.keys():
+            if useindicators:
+                obsEpoch[signal] = {'const': [], 'prn': [], 'val': [], 'ssi': [], 'lli': []}
+            else:
+                obsEpoch[signal] = {'const': [], 'prn': [], 'val': []}
 
-        obsd[signal]['const'].append(const)
-        obsd[signal]['prn'].append(prn)
-        obsd[signal]['val'].append(float(selRecord[i][:14]) if selRecord[i][:14].strip() else np.nan)
-#        obsd[signal]['ssi'].(int(selRecord[i][15]) if selRecord[i][15].strip() else np.nan)
-#        obsd[signal]['lli'](int(selRecord[i][16]) if selRecord[i][16].strip() else np.nan)
+        obsEpoch[signal]['const'].append(const)
+        obsEpoch[signal]['prn'].append(prn)
+        obsEpoch[signal]['val'].append(float(selRecord[i][:14]) if len(selRecord[i]) >= 14 and selRecord[i].strip() else np.nan)
+        if useindicators:
 
-#
-#    for (sm, idx) in gen_filter_meas:
-#        if idx >= len(parts):
-#            continue
-#
-#        if not parts[idx].strip():
-#            continue
-#
-    return obsd
+            obsEpoch[signal]['lli'].append(int(selRecord[i][14]) if len(selRecord[i]) >= 15 and selRecord[i][14].strip() else np.nan)
+            obsEpoch[signal]['ssi'].append(int(selRecord[i][15]) if len(selRecord[i]) == 16 and selRecord[i][15].strip() else np.nan)
 
-
-def _indicators(d: dict, k: str, arr: np.ndarray) -> Dict[str, tuple]:
-    """
-    handle LLI (loss of lock) and SSI (signal strength)
-    """
-    if k.startswith(('L1', 'L2')):
-        d[k+'lli'] = (('time', 'sv'), np.atleast_2d(arr[:, 0]))
-
-    d[k+'ssi'] = (('time', 'sv'), np.atleast_2d(arr[:, 1]))
-
-    return d
+    return obsEpoch
 
 
 def _gen_array(signalTime: List[datetime], signalConst: List[str], signalPrn: List[str],
                const: List[str], prn: List[str], val: List[Any], valarray: np.array,
-               sysname: str) -> xarray.DataArray:
+               sysname: str) -> xr.DataArray:
+    """
+    Generate xarray.DataArray from dictionary. Organise data with 3 coordinates:
+        - time
+        - const(ellation)
+        - prn
+    """
+    # Fill intermediate value numpy array with
     valarray[:] = np.nan
+
+    # organise data into intermediate array.
+    # np.searchsorted uses a significant amount of time. Maybe there is a faster alternative.
     for i, (constList, prnList, valList) in enumerate(zip(const, prn, val)):
         constIdx = np.searchsorted(signalConst, constList)
         prnIdx = np.searchsorted(signalPrn, prnList)
         valarray[i, constIdx, prnIdx] = valList
 
-    return xarray.DataArray(valarray, coords=[signalTime, signalConst, signalPrn], dims=['time', 'const', 'prn'], name=sysname)
+    # Put everything together in xr.DataArray
+    return xr.DataArray(valarray, coords=[signalTime, signalConst, signalPrn], dims=['time', 'const', 'prn'], name=sysname)
 
 
 def obsheader3(f: TextIO):
@@ -302,7 +307,7 @@ def obsheader3(f: TextIO):
 
 def filterObs3(hdr: object,
                use: Sequence[str] = None,
-               meas: Sequence[str] = None):
+               meas: Sequence[str] = None) -> Tuple[dict, dict]:
     """
     Filter header for constellation and signals selected for use. The HeaderClass instance is not modified.
     Output: selObs - Dictionary with selected constellations and selected signals
@@ -320,10 +325,10 @@ def filterObs3(hdr: object,
 
     # Get indices of selected signals and filter selObs respectively
     # Delete constellation key if it holds none of the selected signals
+    selInd = {}
     if meas:
         measSet = set(meas)
 
-        selInd = {}
         _selObsKeys = selObs.keys()
         for k in _selObsKeys:
             indList = []

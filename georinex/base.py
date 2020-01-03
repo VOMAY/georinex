@@ -185,8 +185,7 @@ def rinexobs(fn: Union[TextIO, str, Path],
     elif int(info['version']) == 3:
         obs = rinexobs3(fn, use, tlim=tlim,
                         useindicators=useindicators, meas=meas,
-                        verbose=verbose,
-                        fast=fast, interval=interval)
+                        verbose=verbose, interval=interval)
     else:
         raise ValueError(f'unknown RINEX {info}  {fn}')
 
