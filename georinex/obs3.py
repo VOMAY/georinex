@@ -74,8 +74,22 @@ def rinexobs3(fn: Union[TextIO, str, Path],
 # %% loop
     with opener(fn) as f:
         try:
+            # Read header into HeaderClass instance
             hdr = obsheader3(f)
+
+            # filter signales based on selection via input arguments
             selObs, selInd = filterObs3(hdr, use, meas)
+
+            # Get set of all signals of all constellations
+            signalUnion = set([ signal for constSigList in selObs.values() for signal in constSigList])
+            # Allocate Main internal data buffer
+            bufDict = {}
+#            bufDict['time'] = []
+#            for signal in signalUnion:
+#                bufDict[signal] = {'sv': [], 'val': []}
+            for signal in signalUnion:
+                bufDict[signal] = {'time': [], 'sv': [], 'val': []}
+
         except KeyError:
             return xarray.Dataset()
 
@@ -85,84 +99,110 @@ def rinexobs3(fn: Union[TextIO, str, Path],
                 break
 
             try:
-                time = _timeobs(ln)
+                time, in_range = _timeobs(ln, tlim, last_epoch, interval)
             except ValueError:  # garbage between header and RINEX data
                 logging.debug(f'garbage detected in {fn}, trying to parse at next time step')
                 continue
-# %% get SV indices
-            sv = []
-            raw = ''
+
             # Number of visible satellites this time %i3  pg. A13
-            for _ in range(int(ln[33:35])):
-                ln = f.readline()
-                sv.append(ln[:3])
-                raw += ln[3:]
+            nSv = int(ln[33:35])
+            if in_range == -1:
+                for _ in range(nSv):
+                    next(f)
+                continue
 
-            if tlim is not None:
-                if time < tlim[0]:
-                    continue
-                elif time > tlim[1]:
-                    break
+            if in_range == 1:
+                break
 
-            if interval is not None:
-                if last_epoch is None:  # initialization
-                    last_epoch = time
-                else:
-                    if time - last_epoch < interval:
-                        continue
-                    else:
-                        last_epoch += interval
+            last_epoch = time
 
             if verbose:
                 print(time, end="\r")
 
             # this time epoch is complete, assemble the data.
-            data = _epoch(data, raw, hdr, time, sv, useindicators, verbose)
+            obsd = {}
+            for _, epochLine in zip(range(nSv), f):
+                # Check if this line starts with an expected constellatin letter
+                if epochLine[0] not in hdr.obsType.keys():
+                    raise KeyError(f'Unexpected line found in RINEX file')
 
-# %% patch SV names in case of "G 7" => "G07"
-    data = data.assign_coords(sv=[s.replace(' ', '0') for s in data.sv.values.tolist()])
-# %% other attributes
-    data.attrs['version'] = hdr['version']
+                obsd = _epoch(obsd, selObs, selInd, epochLine)
 
-    # Get interval from header or derive it from the data
-    if 'interval' in hdr.keys():
-        data.attrs['interval'] = hdr['interval']
-    elif 'time' in data.coords.keys():
-        # median is robust against gaps
-        try:
-            data.attrs['interval'] = np.median(np.diff(data.time)/np.timedelta64(1, 's'))
-        except TypeError:
-            pass
-    else:
-        data.attrs['interval'] = np.nan
+            for signal in obsd:
+                bufDict[signal]['time'].append(time)
+                bufDict[signal]['sv'].append(obsd[signal]['sv'])
+                bufDict[signal]['val'].append(obsd[signal]['val'])
 
-    data.attrs['rinextype'] = 'obs'
-    data.attrs['fast_processing'] = 0  # bool is not allowed in NetCDF4
-    data.attrs['time_system'] = determine_time_system(hdr)
-    if isinstance(fn, Path):
-        data.attrs['filename'] = fn.name
+    data = []
+    for signal in bufDict:
+        signalTime = bufDict[signal]['time']
+        signalSv = np.sort(np.array(list(set([sv for svEpochList in bufDict[signal]['sv'] for sv in svEpochList]))))
 
-    if 'position' in hdr.keys():
-        data.attrs['position'] = hdr['position']
-        if ecef2geodetic is not None:
-            data.attrs['position_geodetic'] = hdr['position_geodetic']
+        signalVal = np.empty((len(signalTime), len(signalSv)))
+
+        data.append(_gen_array(signalTime, signalSv, bufDict[signal]['sv'], bufDict[signal]['val'], np.copy(signalVal), signal))
+#        if 'ssi' not in dict_meas[sm]:
+#            continue
+#        data.append(_gen_array(alltime, allsv, dict_meas[sm]['sv'], dict_meas[sm]['ssi'], np.copy(valarray), sm+'-ssi'))
+#        if 'lli' not in dict_meas[sm]:
+#            continue
+#        data.append(_gen_array(alltime, allsv, dict_meas[sm]['sv'], dict_meas[sm]['lli'], np.copy(valarray), sm+'-lli'))
+#
+    data = xarray.merge(data)
+
+    # %% other attributes
+    data.attrs['version'] = hdr.version
+
+#    # Get interval from header or derive it from the data
+#    if 'interval' in hdr.keys():
+#        data.attrs['interval'] = hdr['interval']
+#    elif 'time' in data.coords.keys():
+#        # median is robust against gaps
+#        try:
+#            data.attrs['interval'] = np.median(np.diff(data.time)/np.timedelta64(1, 's'))
+#        except TypeError:
+#            pass
+#    else:
+#        data.attrs['interval'] = np.nan
+#
+#    data.attrs['rinextype'] = 'obs'
+#    data.attrs['fast_processing'] = 0  # bool is not allowed in NetCDF4
+#    data.attrs['time_system'] = determine_time_system(hdr)
+#    if isinstance(fn, Path):
+#        data.attrs['filename'] = fn.name
+#
+#    if 'position' in hdr.keys():
+#        data.attrs['position'] = hdr['position']
+#        if ecef2geodetic is not None:
+#            data.attrs['position_geodetic'] = hdr['position_geodetic']
 
     # data.attrs['toffset'] = toffset
 
     return data
 
 
-def _timeobs(ln: str) -> datetime:
+def _timeobs(ln: str, tlim: Tuple[datetime, datetime] = None,
+             last_epoch: datetime = None, interval: timedelta = None) -> Tuple[datetime, int]:
     """
     convert time from RINEX 3 OBS text to datetime
     """
-    if not ln.startswith('> '):  # pg. A13
-        raise ValueError(f'RINEX 3 line beginning "> " is not present')
 
-    return datetime(int(ln[2:6]), int(ln[7:9]), int(ln[10:12]),
-                    hour=int(ln[13:15]), minute=int(ln[16:18]),
-                    second=int(ln[19:21]),
-                    microsecond=int(float(ln[19:29]) % 1 * 1000000))
+    curr_time = datetime(int(ln[2:6]), int(ln[7:9]), int(ln[10:12]),
+                         hour=int(ln[13:15]), minute=int(ln[16:18]),
+                         second=int(ln[19:21]),
+                         microsecond=int(float(ln[19:29]) % 1 * 1000000))
+
+    in_range = 0
+    if tlim is not None:
+        if curr_time < tlim[0]:
+            in_range = -1
+        if curr_time > tlim[1]:
+            in_range = 1
+
+    if interval is not None and last_epoch is not None and in_range == 0:
+        in_range = -1 if (curr_time - last_epoch < interval) else 0
+
+    return (curr_time, in_range)
 
 
 def obstime3(fn: Union[TextIO, Path],
@@ -175,59 +215,54 @@ def obstime3(fn: Union[TextIO, Path],
     with opener(fn) as f:
         for ln in f:
             if ln.startswith('>'):
-                times.append(_timeobs(ln))
+                times.append(_timeobs(ln)[0])
 
-    times = np.asarray(times)
+    return np.asarray(times)
 
-    check_unique_times(times)
-
-    return times
-
-
-def _epoch(data: xarray.Dataset, raw: str,
-           hdr: Dict[str, Any],
-           time: datetime,
-           sv: List[str],
-           useindicators: bool,
-           verbose: bool) -> xarray.Dataset:
+def _epoch(obsd: Dict[str, Any],
+           selObs: Dict[str, Any],
+           selInd: Dict[str, Any],
+           line: str) -> (Dict[str, Any]):
     """
-    block processing of each epoch (time step)
+    processing of each line in epoch (time step)
     """
-    darr = np.atleast_2d(np.genfromtxt(io.BytesIO(raw.encode('ascii')),
-                                       delimiter=(14, 1, 1) * hdr['Fmax']))
-# %% assign data for each time step
-    for sk in hdr['fields']:  # for each satellite system type (G,R,S, etc.)
-        # satellite indices "si" to extract from this time's measurements
-        si = [i for i, s in enumerate(sv) if s[0] in sk]
-        if len(si) == 0:  # no SV of this system "sk" at this time
-            continue
 
-        # measurement indices "di" to extract at this time step
-        di = hdr['fields_ind'][sk]
-        garr = darr[si, :]
-        garr = garr[:, di]
+    # Check if constellation is selected
+    sv = line[0:3].replace(' ', '0')
+    const = sv[0]
+    if const not in selObs.keys():
+        return obsd
 
-        gsv = np.array(sv)[si]
+    # Ensure 16-columns per record and filter the selected records into list
+    recordStr = line[3:]
+    recordStr = recordStr + ' '*(len(recordStr) % 16)
+    selRecord = [recordStr[i*16:i*16+16] for i in selInd[const]]
 
-        dsf: Dict[str, tuple] = {}
-        for i, k in enumerate(hdr['fields'][sk]):
-            dsf[k] = (('time', 'sv'), np.atleast_2d(garr[:, i*3]))
+    # Store information in buffer dictionary
+    for i, signal in enumerate(selObs[const]):
+        # Create key if not available
+        if signal not in obsd.keys():
+            obsd[signal] = {'sv': [], 'val': []}
+#            obsd[signal] = {'sv': [], 'val': [], 'ssi': [], 'lli': []}
 
-            if useindicators:
-                dsf = _indicators(dsf, k, garr[:, i*3+1:i*3+3])
+        obsd[signal]['sv'].append(sv)
+        obsd[signal]['val'].append(float(selRecord[i][:14]) if selRecord[i][:14].strip() else np.nan)
+#        obsd[signal]['ssi'].(int(selRecord[i][15]) if selRecord[i][15].strip() else np.nan)
+#        obsd[signal]['lli'](int(selRecord[i][16]) if selRecord[i][16].strip() else np.nan)
 
-        if verbose:
-            print(time, '\r', end='')
 
-        epoch_data = xarray.Dataset(dsf, coords={'time': [time], 'sv': gsv})
-        if len(data) == 0:
-            data = epoch_data
-        elif len(hdr['fields']) == 1:  # one satellite system selected, faster to process
-            data = xarray.concat((data, epoch_data), dim='time')
-        else:  # general case, slower for different satellite systems all together
-            data = xarray.merge((data, epoch_data))
+#    obsd[]
+#    gen_filter_meas = ((sm, sysmeas_idx[sm]) for sm in sysmeas_idx if sys+'_' in sm)
+#
+#    for (sm, idx) in gen_filter_meas:
+#        if idx >= len(parts):
+#            continue
+#
+#        if not parts[idx].strip():
+#            continue
+#
 
-    return data
+    return obsd
 
 
 def _indicators(d: dict, k: str, arr: np.ndarray) -> Dict[str, tuple]:
@@ -240,6 +275,17 @@ def _indicators(d: dict, k: str, arr: np.ndarray) -> Dict[str, tuple]:
     d[k+'ssi'] = (('time', 'sv'), np.atleast_2d(arr[:, 1]))
 
     return d
+
+
+def _gen_array(alltime: List[datetime], allsv: List[str],
+               sv: List[str], val: List[Any], valarray: np.array,
+               sysname: str) -> xarray.DataArray:
+    valarray[:] = np.nan
+    for i, (svl, ml) in enumerate(zip(sv, val)):
+        idx = np.searchsorted(allsv, svl)
+        valarray[i, idx] = ml
+
+    return xarray.DataArray(valarray, coords=[alltime, allsv], dims=['time', 'sv'], name=sysname)
 
 
 def obsheader3(f: TextIO):
@@ -255,8 +301,10 @@ def obsheader3(f: TextIO):
 
     # Read line-by-line
     for ln in f:
-        # read RINEX header label and check if it is relevant
+        # read RINEX header labels and check if it is relevant
         h = ln[60:80].strip()
+        if h == "END OF HEADER":
+            break
         if h not in HeaderClass.labelDict.keys():
             continue
 
@@ -271,7 +319,7 @@ def filterObs3(hdr: object,
                meas: Sequence[str] = None):
     """
     Filter header for constellation and signals selected for use. The HeaderClass instance is not modified.
-    Output: selObs - Dictionary with selected constellations
+    Output: selObs - Dictionary with selected constellations and selected signals
             selInd - Dictionary with selected signals
     """
 
@@ -284,12 +332,14 @@ def filterObs3(hdr: object,
     else:
         selObs = hdr.obsType
 
-    # Get indices of selected signals
+    # Get indices of selected signals and filter selObs respectively
+    # Delete constellation key if it holds none of the selected signals
     if meas:
         measSet = set(meas)
 
         selInd = {}
-        for k in selObs.keys():
+        _selObsKeys = selObs.keys()
+        for k in _selObsKeys:
             indList = []
             for m in measSet:
                 for i, o in enumerate(selObs[k]):
@@ -297,9 +347,15 @@ def filterObs3(hdr: object,
                         indList.append(i)
             if indList:
                 selInd[k] = set(indList)
+                obsList = [ selObs[k][i] for i in selInd[k] ]
+                selObs[k] = obsList
+            else:
+                del selObs[k]
+
         if not selInd.keys():
             raise KeyError(f'measurement type {meas} not found in RINEX file')
     else:
-        selInd = None
+        for k in selObs.keys():
+            selInd[k] = list(range(len(selObs[k])))
 
     return (selObs, selInd)

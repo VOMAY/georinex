@@ -175,7 +175,7 @@ class HeaderClass:
     """
 
     # Dictionary mapping the RINEX header labels to the correct parsing function
-    labelDict = {'RINEX VERSION / TYPE': 'pInfo',
+    labelDict = {'RINEX VERSION / TYPE': ['pInfo', 5],
                  'MARKER NAME': 'pMarkerName',
                  'MARKER NUMBER': 'pMarkerNumber',
                  'OBSERVER / AGENCY': 'pObservAgency',
